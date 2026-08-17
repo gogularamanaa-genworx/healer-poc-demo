@@ -1,0 +1,131 @@
+name: heal-apply
+on:
+  issue_comment:
+    types: [created]
+
+# Runs from the DEFAULT branch's workflow file regardless of what the PR
+# touched — a PR author cannot edit this file in their own PR to bypass the
+# RBAC check below.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  apply:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/approve')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: heal-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Verify commenter is a maintainer (RBAC — two layers)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSOC: ${{ github.event.comment.author_association }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *) echo "::error::author_association '$ASSOC' is not a maintainer — refusing."; exit 1 ;;
+          esac
+          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" -q .permission)
+          echo "Resolved permission for $ACTOR: $perm"
+          if [ "$perm" != "admin" ] && [ "$perm" != "write" ]; then
+            echo "::error::$ACTOR has permission '$perm' — refusing to apply."
+            exit 1
+          fi
+
+      - name: Resolve PR head branch + sha
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh api "repos/$REPO/pulls/$PR_NUMBER" -q '.head.ref' > /tmp/ref
+          gh api "repos/$REPO/pulls/$PR_NUMBER" -q '.head.sha' > /tmp/sha
+          echo "ref=$(cat /tmp/ref)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(cat /tmp/sha)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+          fetch-depth: 0
+
+      # The triggering comment is just "/approve" — the diff+metadata live in
+      # the BOT'S proposal comment, a separate comment on the same PR. Find
+      # it explicitly rather than assuming which comment fired the event.
+      - name: Find the proposal comment (durable checkpoint)
+        id: find-proposal
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: 'healer-bot:proposal:v1'
+
+      - name: Extract state from the proposal comment
+        id: state
+        if: steps.find-proposal.outputs.comment-id != ''
+        env:
+          COMMENT_BODY: ${{ steps.find-proposal.outputs.comment-body }}
+        run: |
+          node -e '
+            const body = process.env.COMMENT_BODY;
+            const m = body.match(/<!-- healer-state\n([\s\S]*?)\n-->/);
+            if (!m) { console.error("No healer-state block found in comment."); process.exit(1); }
+            const state = JSON.parse(Buffer.from(m[1].trim(), "base64").toString("utf8"));
+            require("fs").writeFileSync("candidate.diff", Buffer.from(state.diff, "utf8"));
+            console.log("baseSha=" + state.baseSha);
+          ' | tee /tmp/state.out
+          grep "^baseSha=" /tmp/state.out >> "$GITHUB_OUTPUT"
+
+      - name: No pending proposal found
+        if: steps.find-proposal.outputs.comment-id == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -f body="ℹ️ No pending healer proposal found to approve on this PR."
+          exit 0
+
+      - name: Race check — has the branch moved since the proposal?
+        id: race
+        if: steps.find-proposal.outputs.comment-id != ''
+        run: |
+          current="${{ steps.pr.outputs.sha }}"
+          expected="${{ steps.state.outputs.baseSha }}"
+          echo "current=$current expected=$expected"
+          if [ "$current" = "$expected" ]; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          elif git apply --3way --check candidate.diff 2>/dev/null; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Branch moved but patch still applies via 3-way merge."
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply + commit to the SAME PR branch
+        if: steps.race.outputs.clean == 'true'
+        run: |
+          git apply --3way candidate.diff || git apply candidate.diff
+          git config user.name 'healer-bot'
+          git config user.email 'healer-bot@users.noreply.github.com'
+          git commit -am "fix(test): apply approved heal [auto-healed against ${{ steps.state.outputs.baseSha }}]"
+          git push origin HEAD:${{ steps.pr.outputs.ref }}
+
+      - name: Mark the proposal comment applied (same comment, updated in place)
+        if: steps.race.outputs.clean == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${{ steps.find-proposal.outputs.comment-id }}" \
+            -f body="✅ Applied — approved by @${{ github.event.comment.user.login }}. See the new commit on this branch."
+
+      - name: Refuse — branch changed and patch conflicts
+        if: steps.race.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -f body="⚠️ This branch changed since the fix was proposed and the patch no longer applies cleanly. A fresh proposal will run on the next push."

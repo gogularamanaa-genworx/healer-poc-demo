@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Healer POC Demo App</title>
+</head>
+<body>
+  <h1>Invoice Form</h1>
+  <button id="submit-btn">Submit</button>
+  <p id="status"></p>
+
+  <script>
+    document.getElementById('submit-btn').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'Submitted!';
+    });
+  </script>
+</body>
+</html>

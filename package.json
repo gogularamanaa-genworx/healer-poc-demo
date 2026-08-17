@@ -1,0 +1,13 @@
+{
+  "name": "healer-poc-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Throwaway sandbox repo demonstrating the HITL test-healing agent end to end.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "http-server": "^14.1.1"
+  }
+}

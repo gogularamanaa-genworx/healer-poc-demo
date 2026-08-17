@@ -1,0 +1,105 @@
+name: heal-propose
+on:
+  pull_request:
+
+concurrency:
+  group: heal-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      - name: Run tests
+        id: test
+        run: npx playwright test --reporter=json > results.json
+        continue-on-error: true
+
+      # classify.js's exit code (see scripts/classify.js) is the routing
+      # signal: 20=test-fix 21=app-bug 22=infra-only 0=no failures.
+      # `set +e` around it because GitHub's default `bash -e` would abort
+      # the step before we get to read $? otherwise.
+      - name: Classify failure
+        id: classify
+        if: steps.test.outcome == 'failure'
+        run: |
+          set +e
+          node scripts/classify.js results.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Find existing proposal comment
+        id: find-comment
+        if: steps.test.outcome == 'failure'
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: 'healer-bot:proposal:v1'
+
+      - name: Notify — infra/flake (no code touched, no LLM call)
+        if: steps.classify.outputs.code == '22'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            <!-- healer-bot:proposal:v1 -->
+            ## ⚙️ Infra/flake-shaped failure — not sent to the LLM
+
+            This failure matches a known infra pattern (network/boot timeout),
+            not a test or app issue. Re-run the job; escalate if it repeats.
+
+      - name: Attempt heal (Job 2, one-shot Tier-1)
+        id: heal
+        if: steps.classify.outputs.code == '20'
+        run: node scripts/heal.js
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Validate candidate (deterministic gate)
+        id: validate
+        if: steps.heal.outcome == 'success'
+        run: node scripts/validate.js
+        continue-on-error: true
+
+      - name: Render proposal
+        id: render
+        if: steps.validate.outcome == 'success'
+        run: node scripts/render-proposal.js
+
+      - name: Post/update proposal comment
+        if: steps.render.outcome == 'success'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body-path: proposal.md
+
+      - name: Flag — real bug suspected or fix failed validation (no code touched)
+        if: steps.classify.outputs.code == '21' || (steps.classify.outputs.code == '20' && steps.validate.outcome != 'success')
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            <!-- healer-bot:proposal:v1 -->
+            ## 🐛 Could not safely heal this failure
+
+            Either this looks like a real application change (not a stale
+            test), or a candidate fix failed validation. No code was
+            modified — please investigate manually.

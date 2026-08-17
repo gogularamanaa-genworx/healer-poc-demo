@@ -1,0 +1,9 @@
+node_modules/
+test-results/
+playwright-report/
+results.json
+classification.json
+candidate.diff
+meta.json
+heal-result.json
+proposal.md
