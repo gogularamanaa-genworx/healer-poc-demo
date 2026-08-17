@@ -13,10 +13,15 @@ like the application returned a genuinely different value or behavior — do
 not propose a fix. Instead respond with exactly: NO_SAFE_FIX: <one sentence
 reason>.
 
-If it is a safe mechanical fix, respond with ONLY a unified diff (git diff
-format, paths relative to repo root) that changes the minimum necessary
-lines in the test file. No prose, no explanation, no markdown fences around
-it — just the raw diff text starting with `--- a/`.
+If it is a safe mechanical fix, respond with EXACTLY two lines and nothing
+else — no prose, no explanation, no markdown fences:
+
+OLD_LINE: <the single exact line, verbatim, from the test source that must change>
+NEW_LINE: <that same line, rewritten with the minimum necessary change>
+
+OLD_LINE must match one line of the test source character-for-character
+(same indentation, same quotes) so it can be located by exact string match —
+do not paraphrase it. Change only what the page snapshot proves changed.
 
 --- BEGIN CONTEXT ---
 {{ERROR_CONTEXT}}

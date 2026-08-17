@@ -7,7 +7,7 @@ project for the full design this demonstrates a slice of.
 ## What this proves
 
 1. A code change breaks an e2e test.
-2. The healer diagnoses it (real LLM call, Claude Haiku) and posts a
+2. The healer diagnoses it (real LLM call, Gemini) and posts a
    structured proposal comment — root cause, confidence checklist,
    collapsible diff — instead of silently fixing anything.
 3. A maintainer reviews the diff in the PR and comments `/approve`.
@@ -46,7 +46,7 @@ Plus two edge cases that prove the safety claims aren't just theoretical:
 
 ```bash
 gh repo create <your-username>/healer-poc-demo --public --source=. --remote=origin
-gh secret set ANTHROPIC_API_KEY --repo <your-username>/healer-poc-demo
+gh secret set GEMINI_API_KEY --repo <your-username>/healer-poc-demo
 # ^ paste your key at the prompt — it never touches git history or chat logs
 git push -u origin main
 ```
