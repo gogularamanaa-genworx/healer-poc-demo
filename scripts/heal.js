@@ -7,28 +7,35 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const MODEL = 'claude-haiku-4-5-20251001';
+// Flagship-tier per the user's request for "the better model." Confirmed
+// mechanics (endpoint shape, ?key= auth, contents/parts request body,
+// candidates[0].content.parts[0].text response) against Google's own API
+// reference. The exact model ID below is the most current one found there
+// at write time — Google's model lineup moves fast, so if this 404s, it
+// fails loudly and cleanly (not a silent wrong answer); swap the one
+// constant to whatever ai.google.dev/gemini-api/docs/models lists.
+const MODEL = 'gemini-3.1-pro-preview';
 const PROMPT_TEMPLATE = fs.readFileSync(path.join(__dirname, 'prompts/heal.md'), 'utf8');
 
-async function callClaude(prompt) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+async function callGemini(prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 1024,
-      messages: [{ role: 'user', content: prompt }],
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 2048 },
     }),
   });
   if (!res.ok) {
-    throw new Error(`Anthropic API error ${res.status}: ${await res.text()}`);
+    throw new Error(`Gemini API error ${res.status}: ${await res.text()}`);
   }
   const data = await res.json();
-  return data.content.map((b) => b.text || '').join('');
+  const candidate = data.candidates && data.candidates[0];
+  if (!candidate || !candidate.content) {
+    throw new Error(`Gemini returned no usable candidate (finishReason: ${candidate && candidate.finishReason}).`);
+  }
+  return candidate.content.parts.map((p) => p.text || '').join('');
 }
 
 async function main() {
@@ -46,7 +53,7 @@ async function main() {
   const errorContext = fs.readFileSync(target.errorContextPath, 'utf8');
   const prompt = PROMPT_TEMPLATE.replace('{{ERROR_CONTEXT}}', errorContext);
 
-  const raw = await callClaude(prompt);
+  const raw = await callGemini(prompt);
   const trimmed = raw.trim();
 
   if (trimmed.startsWith('NO_SAFE_FIX')) {
