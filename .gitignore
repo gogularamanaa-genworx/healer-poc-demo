@@ -6,4 +6,5 @@ classification.json
 candidate.diff
 meta.json
 heal-result.json
+heal-raw-response.txt
 proposal.md
