@@ -7,6 +7,6 @@ edits this file.
 """
 
 
-def get_menu() -> dict:
+def list_menu() -> dict:
     """Return the navigation menu payload served to the frontend."""
     return {"items": ["dashboard", "invoices", "reports"]}
