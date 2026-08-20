@@ -26,6 +26,7 @@ const statePayload = Buffer.from(
 const body = `<!-- healer-bot:proposal:v1 -->
 ## 🩹 Test fix proposed — \`${meta.targetTest}\`
 
+**Framework:** ${meta.framework}
 **File:** \`${meta.targetFile}\`
 **Tier:** ${meta.tier} (mechanical)
 **Model:** ${meta.model}
