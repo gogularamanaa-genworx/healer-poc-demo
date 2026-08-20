@@ -36,8 +36,50 @@ jobs:
             exit 1
           fi
 
+      # Find the MOST RECENT healer proposal comment and check it hasn't
+      # already been applied. Comments are never edited/overwritten in this
+      # design (see heal-propose.yml) — every proposal is permanent history
+      # — so "already applied?" has to be answered by searching for a later
+      # resolution comment that names this proposal's comment id, not by
+      # the proposal's own body having been mutated.
+      - name: Find latest proposal + check idempotency
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            -q '[.[] | select(.body | contains("healer-bot:proposal"))] | sort_by(.created_at) | last' \
+            > /tmp/proposal.json
+          id=$(jq -r '.id // empty' /tmp/proposal.json)
+          if [ -z "$id" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "comment-id=$id" >> "$GITHUB_OUTPUT"
+          jq -r '.body' /tmp/proposal.json > /tmp/proposal-body.txt
+
+          already=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            -q "[.[] | select(.body | contains(\"resolves proposal #$id\"))] | length")
+          echo "already-applied=$( [ "$already" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+
+      - name: No proposal found
+        if: steps.find.outputs.found != 'true'
+        run: gh pr comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body "ℹ️ No healer proposal found on this PR to approve."
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Already applied — refuse duplicate approval
+        if: steps.find.outputs.found == 'true' && steps.find.outputs.already-applied == 'true'
+        run: gh pr comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body "ℹ️ Proposal #${{ steps.find.outputs.comment-id }} was already applied — this \`/approve\` is a no-op."
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Resolve PR head branch + sha
         id: pr
+        if: steps.find.outputs.found == 'true' && steps.find.outputs.already-applied != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -48,50 +90,40 @@ jobs:
           echo "ref=$(cat /tmp/ref)" >> "$GITHUB_OUTPUT"
           echo "sha=$(cat /tmp/sha)" >> "$GITHUB_OUTPUT"
 
+      # Uses a PAT (HEALER_PAT), not the default GITHUB_TOKEN. If this push
+      # authenticates as github-actions[bot] (the default token's identity),
+      # GitHub attributes the resulting pull_request:synchronize event to
+      # that bot actor — and, per a GitHub Actions security change rolled
+      # out mid-2026, bot-triggered PR synchronize events on public repos
+      # get gated behind manual "Approve workflows to run" even though the
+      # human /approve already happened. A PAT from an actual maintainer
+      # account makes the push (and the resulting re-run) attributable to a
+      # trusted human, so it runs immediately like any other push would.
       - uses: actions/checkout@v4
+        if: steps.find.outputs.found == 'true' && steps.find.outputs.already-applied != 'true'
         with:
           ref: ${{ steps.pr.outputs.ref }}
           fetch-depth: 0
-
-      # The triggering comment is just "/approve" — the diff+metadata live in
-      # the BOT'S proposal comment, a separate comment on the same PR. Find
-      # it explicitly rather than assuming which comment fired the event.
-      - name: Find the proposal comment (durable checkpoint)
-        id: find-proposal
-        uses: peter-evans/find-comment@v3
-        with:
-          issue-number: ${{ github.event.issue.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: 'healer-bot:proposal:v1'
+          token: ${{ secrets.HEALER_PAT }}
 
       - name: Extract state from the proposal comment
         id: state
-        if: steps.find-proposal.outputs.comment-id != ''
-        env:
-          COMMENT_BODY: ${{ steps.find-proposal.outputs.comment-body }}
+        if: steps.find.outputs.found == 'true' && steps.find.outputs.already-applied != 'true'
         run: |
           node -e '
-            const body = process.env.COMMENT_BODY;
+            const fs = require("fs");
+            const body = fs.readFileSync("/tmp/proposal-body.txt", "utf8");
             const m = body.match(/<!-- healer-state\n([\s\S]*?)\n-->/);
-            if (!m) { console.error("No healer-state block found in comment."); process.exit(1); }
+            if (!m) { console.error("No healer-state block found in proposal comment."); process.exit(1); }
             const state = JSON.parse(Buffer.from(m[1].trim(), "base64").toString("utf8"));
-            require("fs").writeFileSync("candidate.diff", Buffer.from(state.diff, "utf8"));
+            fs.writeFileSync("candidate.diff", Buffer.from(state.diff, "utf8"));
             console.log("baseSha=" + state.baseSha);
           ' | tee /tmp/state.out
           grep "^baseSha=" /tmp/state.out >> "$GITHUB_OUTPUT"
 
-      - name: No pending proposal found
-        if: steps.find-proposal.outputs.comment-id == ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
-            -f body="ℹ️ No pending healer proposal found to approve on this PR."
-          exit 0
-
       - name: Race check — has the branch moved since the proposal?
         id: race
-        if: steps.find-proposal.outputs.comment-id != ''
+        if: steps.find.outputs.found == 'true' && steps.find.outputs.already-applied != 'true'
         run: |
           current="${{ steps.pr.outputs.sha }}"
           expected="${{ steps.state.outputs.baseSha }}"
@@ -114,18 +146,16 @@ jobs:
           git commit -am "fix(test): apply approved heal [auto-healed against ${{ steps.state.outputs.baseSha }}]"
           git push origin HEAD:${{ steps.pr.outputs.ref }}
 
-      - name: Mark the proposal comment applied (same comment, updated in place)
+      - name: Record resolution — new comment, proposal above stays intact
         if: steps.race.outputs.clean == 'true'
+        run: |
+          gh pr comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body "✅ Applied — approved by @${{ github.event.comment.user.login }}. resolves proposal #${{ steps.find.outputs.comment-id }} → commit \`$(git rev-parse HEAD)\`."
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${{ steps.find-proposal.outputs.comment-id }}" \
-            -f body="✅ Applied — approved by @${{ github.event.comment.user.login }}. See the new commit on this branch."
 
       - name: Refuse — branch changed and patch conflicts
         if: steps.race.outputs.clean == 'false'
+        run: |
+          gh pr comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body "⚠️ This branch changed since proposal #${{ steps.find.outputs.comment-id }} was posted and the patch no longer applies cleanly. A fresh proposal will run on the next push."
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
-            -f body="⚠️ This branch changed since the fix was proposed and the patch no longer applies cleanly. A fresh proposal will run on the next push."

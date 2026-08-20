@@ -2,10 +2,6 @@ name: heal-propose
 on:
   pull_request:
 
-concurrency:
-  group: heal-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
   pull-requests: write
@@ -13,53 +9,80 @@ permissions:
 jobs:
   propose:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # One job per framework. Each is independent (its own report, classification,
+    # candidate, and proposal comment), so a Playwright failure and a pytest
+    # failure on the same PR produce two separate proposals that can be approved
+    # independently.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: playwright
+            report: results.json
+          - framework: pytest
+            report: pytest-results.json
+          - framework: vitest
+            report: vitest-results.json
+    # Per-framework concurrency so the three matrix jobs never cancel each other,
+    # while a new push still supersedes an in-flight run for the SAME framework.
+    concurrency:
+      group: heal-${{ github.event.pull_request.number }}-${{ matrix.framework }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        if: matrix.framework == 'pytest'
+        with: { python-version: '3.12' }
+
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      - name: Install pytest deps
+        if: matrix.framework == 'pytest'
+        run: pip install -r requirements-dev.txt
+      - name: Install Playwright browsers
+        if: matrix.framework == 'playwright'
+        run: npx playwright install --with-deps chromium
 
       - name: Run tests
         id: test
-        run: npx playwright test --reporter=json > results.json
         continue-on-error: true
+        run: |
+          case "${{ matrix.framework }}" in
+            playwright) npx playwright test ;;
+            pytest)     pytest --json-report --json-report-file=pytest-results.json ;;
+            vitest)     npx vitest run --reporter=json --outputFile=vitest-results.json ;;
+          esac
 
-      # classify.js's exit code (see scripts/classify.js) is the routing
-      # signal: 20=test-fix 21=app-bug 22=infra-only 0=no failures.
-      # `set +e` around it because GitHub's default `bash -e` would abort
-      # the step before we get to read $? otherwise.
+      # classify.js's exit code is the routing signal:
+      # 20=test-fix 21=app-bug 22=infra-only 0=no failures.
+      # `set +e` so bash -e doesn't abort before we read $?.
       - name: Classify failure
         id: classify
         if: steps.test.outcome == 'failure'
         run: |
           set +e
-          node scripts/classify.js results.json
+          node scripts/classify.js ${{ matrix.framework }} ${{ matrix.report }}
           echo "code=$?" >> "$GITHUB_OUTPUT"
           set -e
 
-      - name: Find existing proposal comment
-        id: find-comment
-        if: steps.test.outcome == 'failure'
-        uses: peter-evans/find-comment@v3
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: 'healer-bot:proposal:v1'
+      # Every event below POSTS A NEW comment — never edits a prior one.
+      # GitHub's comment timeline IS the audit trail.
 
       - name: Notify — infra/flake (no code touched, no LLM call)
         if: steps.classify.outputs.code == '22'
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          comment-id: ${{ steps.find-comment.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            <!-- healer-bot:proposal:v1 -->
-            ## ⚙️ Infra/flake-shaped failure — not sent to the LLM
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$(cat <<'EOF'
+          <!-- healer-bot:proposal -->
+          ## ⚙️ Infra/flake-shaped failure (${{ matrix.framework }}) — not sent to the LLM
 
-            This failure matches a known infra pattern (network/boot timeout),
-            not a test or app issue. Re-run the job; escalate if it repeats.
+          This failure matches a known infra pattern (network/boot timeout),
+          not a test or app issue. Re-run the job; escalate if it repeats.
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Attempt heal (Job 2, one-shot Tier-1)
         id: heal
@@ -80,26 +103,23 @@ jobs:
         if: steps.validate.outcome == 'success'
         run: node scripts/render-proposal.js
 
-      - name: Post/update proposal comment
+      - name: Post proposal comment
         if: steps.render.outcome == 'success'
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          comment-id: ${{ steps.find-comment.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body-path: proposal.md
+        run: gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body-file proposal.md
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Flag — real bug suspected or fix failed validation (no code touched)
         if: steps.classify.outputs.code == '21' || (steps.classify.outputs.code == '20' && steps.validate.outcome != 'success')
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          comment-id: ${{ steps.find-comment.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            <!-- healer-bot:proposal:v1 -->
-            ## 🐛 Could not safely heal this failure
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$(cat <<'EOF'
+          <!-- healer-bot:proposal -->
+          ## 🐛 Could not safely heal this failure (${{ matrix.framework }})
 
-            Either this looks like a real application change (not a stale
-            test), or a candidate fix failed validation. No code was
-            modified — please investigate manually.
+          Either this looks like a real application change (not a stale
+          test), or a candidate fix failed validation. No code was
+          modified — please investigate manually.
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ github.token }}
