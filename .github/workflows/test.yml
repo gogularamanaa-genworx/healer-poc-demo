@@ -5,10 +5,24 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
       - run: npm ci
+      - run: pip install -r requirements-dev.txt
       - run: npx playwright install --with-deps chromium
-      - run: npx playwright test
+
+      # Each suite runs even if an earlier one failed, so the gate reports the
+      # true red/green of all three frameworks rather than stopping at the first.
+      - name: Playwright
+        run: npx playwright test
+      - name: pytest
+        if: '!cancelled()'
+        run: pytest
+      - name: vitest
+        if: '!cancelled()'
+        run: npx vitest run

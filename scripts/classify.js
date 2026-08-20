@@ -1,58 +1,72 @@
 #!/usr/bin/env node
-// Reads Playwright's JSON reporter output and classifies each failure as
-// infra | app-bug | test-fix. Schema fields below were confirmed by running
-// --reporter=json against a real failure, not inferred (see project notes:
-// Playwright's JSON reporter schema is undocumented upstream).
+// Framework-agnostic classifier. Usage:
+//   node scripts/classify.js <framework> <reportPath>
+// Delegates report parsing to the per-framework adapter, then applies one
+// shared triage: infra -> app-bug -> test-fix. Only 'test-fix' is ever sent to
+// the LLM; 'app-bug' (a real value/behaviour change) is flagged, never healed.
 const fs = require('fs');
+const { INFRA_PATTERNS } = require('./lib/schema');
 
-const INFRA_PATTERNS = [/ECONNREFUSED/i, /net::ERR_/i, /getaddrinfo/i, /timed out waiting for/i /* webServer boot */];
+const adapters = {
+  playwright: require('./lib/adapters/playwright'),
+  pytest: require('./lib/adapters/pytest'),
+  vitest: require('./lib/adapters/vitest'),
+};
 
-function collectFailures(resultsPath) {
-  const report = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
-  const failures = [];
-  for (const suite of report.suites || []) {
-    for (const spec of suite.specs || []) {
-      if (spec.ok) continue;
-      for (const t of spec.tests || []) {
-        const last = t.results[t.results.length - 1];
-        if (!last || last.status === 'passed') continue;
-        const errorContext = (last.attachments || []).find((a) => a.name === 'error-context');
-        failures.push({
-          file: suite.file,
-          title: spec.title,
-          status: last.status,
-          message: (last.error && last.error.message || '').replace(/\[[0-9;]*m/g, ''),
-          errorContextPath: errorContext ? errorContext.path : null,
-        });
-      }
-    }
-  }
-  return failures;
-}
+// A stale *test* reference (renamed selector / symbol / export) is mechanical
+// and healable. A value/assertion mismatch is a suspected app change and must
+// never be auto-healed — it falls through to 'app-bug'.
+const TEST_FIX_SIGNALS = {
+  playwright: /waiting for|strict mode violation|locator\./i,
+  pytest: /AttributeError|ImportError|ModuleNotFoundError|NameError|has no attribute/i,
+  vitest: /is not a function|does not provide an export named|Cannot find module|is not defined/i,
+};
 
 function classify(failure) {
-  if (INFRA_PATTERNS.some((re) => re.test(failure.message))) {
+  const text = `${failure.message}\n${failure.context || ''}`;
+  if (INFRA_PATTERNS.some((re) => re.test(text))) {
     return { class: 'infra', reason: 'Matches a known infra/network failure pattern.' };
   }
-  // Anything that timed out waiting on a locator, or a strict-mode violation,
-  // is a candidate test-fix (mechanical, Tier 1). Everything else — a real
-  // assertion mismatch on a value the app returned — is treated as a
-  // possible app bug and must never be auto-healed.
-  const looksLikeLocatorIssue = /waiting for|strict mode violation|locator\./i.test(failure.message)
-    || failure.status === 'timedOut';
-  return looksLikeLocatorIssue
-    ? { class: 'test-fix', reason: 'Timed out waiting on a locator — likely a stale selector.' }
-    : { class: 'app-bug', reason: 'Failure is an assertion/value mismatch, not a locator timeout — needs human judgment.' };
+  const signal = TEST_FIX_SIGNALS[failure.framework];
+  // A stale-reference signal in the text is what makes a failure healable. A
+  // bare timeout with NO such signal is treated as a suspected app hang
+  // (app-bug, the safe default) — never auto-healed. `timedOut` only counts as
+  // mechanical as a tiebreaker when there is no diagnostic text at all.
+  const hasSignal = signal ? signal.test(text) : false;
+  const looksMechanical =
+    hasSignal || (failure.status === 'timedOut' && !text.trim());
+  return looksMechanical
+    ? { class: 'test-fix', reason: 'Stale test reference (renamed selector/symbol/export) — mechanically healable.' }
+    : { class: 'app-bug', reason: 'No stale-reference signal — suspected real app change; needs human judgment.' };
 }
 
-const resultsPath = process.argv[2] || 'results.json';
-const failures = collectFailures(resultsPath).map((f) => ({ ...f, ...classify(f) }));
-fs.writeFileSync('classification.json', JSON.stringify(failures, null, 2));
-console.log(`Classified ${failures.length} failure(s):`);
-for (const f of failures) console.log(`  - ${f.title}: ${f.class} (${f.reason})`);
+function main() {
+  const framework = process.argv[2];
+  const reportPath = process.argv[3];
 
-// Exit code communicates the dominant path to the workflow (bash-friendly).
-if (failures.some((f) => f.class === 'test-fix')) process.exit(20);
-if (failures.some((f) => f.class === 'app-bug')) process.exit(21);
-if (failures.length) process.exit(22); // infra only
-process.exit(0); // no failures
+  if (!adapters[framework]) {
+    console.error(`Unknown framework '${framework}'. Expected one of: ${Object.keys(adapters).join(', ')}`);
+    process.exit(2);
+  }
+  if (!reportPath || !fs.existsSync(reportPath)) {
+    console.log(`No report at '${reportPath}' — treating as no failures.`);
+    process.exit(0);
+  }
+
+  const failures = adapters[framework].collect(reportPath).map((f) => ({ ...f, ...classify(f) }));
+  fs.writeFileSync('classification.json', JSON.stringify(failures, null, 2));
+  console.log(`[${framework}] Classified ${failures.length} failure(s):`);
+  for (const f of failures) console.log(`  - ${f.title}: ${f.class} (${f.reason})`);
+
+  // Exit code communicates the dominant path to the workflow (bash-friendly):
+  // 20=test-fix 21=app-bug 22=infra-only 0=no failures.
+  if (failures.some((f) => f.class === 'test-fix')) process.exit(20);
+  if (failures.some((f) => f.class === 'app-bug')) process.exit(21);
+  if (failures.length) process.exit(22);
+  process.exit(0);
+}
+
+// Run as CLI; export classify so its safety-critical routing is unit-testable.
+if (require.main === module) main();
+
+module.exports = { classify };
