@@ -2,12 +2,15 @@
   "name": "healer-poc-demo",
   "version": "1.0.0",
   "private": true,
-  "description": "Throwaway sandbox repo demonstrating the HITL test-healing agent end to end.",
+  "description": "Throwaway sandbox repo demonstrating the HITL test-healing agent end to end across Playwright, pytest, and vitest.",
   "scripts": {
-    "test": "playwright test"
+    "test:unit": "node --test tests/unit/*.test.js",
+    "test:playwright": "playwright test",
+    "test:vitest": "vitest run"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
-    "http-server": "^14.1.1"
+    "http-server": "^14.1.1",
+    "vitest": "^2.1.9"
   }
 }

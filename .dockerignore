@@ -1,6 +1,9 @@
 node_modules/
+.venv/
+.git/
 test-results/
 playwright-report/
+*.json.tmp
 results.json
 pytest-results.json
 vitest-results.json
@@ -10,6 +13,7 @@ meta.json
 heal-result.json
 heal-raw-response.txt
 proposal.md
-.venv/
-.pytest_cache/
 __pycache__/
+.pytest_cache/
+apps/
+tests/
