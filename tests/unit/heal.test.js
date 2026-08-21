@@ -58,3 +58,21 @@ test('buildContext (vitest) includes renamed app iface', () => {
 test('buildContext (playwright) throws when error-context file is missing', () => {
   assert.throws(() => buildContext({ framework: 'playwright', contextPath: 'nope.md' }));
 });
+
+test('buildContext (pytest): HEALER_SOURCE_DIR overrides the built-in default', () => {
+  const original = process.env.HEALER_SOURCE_DIR;
+  // A repo-relative dir that actually exists but is NOT the pytest default
+  // (apps/py) — proves the override is honored, not silently ignored.
+  process.env.HEALER_SOURCE_DIR = 'apps/js';
+  try {
+    const ctx = buildContext({
+      framework: 'pytest',
+      file: 'tests/pytest/test_bff.py',
+      message: 'AttributeError',
+      context: 'has no attribute fetch_menu',
+    });
+    assert.ok(ctx.includes('export function getMenu'), 'reads from the overridden dir, not the pytest default');
+  } finally {
+    if (original === undefined) delete process.env.HEALER_SOURCE_DIR; else process.env.HEALER_SOURCE_DIR = original;
+  }
+});

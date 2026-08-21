@@ -24,6 +24,84 @@ Everything else (RBAC, race-check, `/approve` apply, comment audit trail) is
 shared and framework-blind — `heal-apply.yml` just applies whatever diff the
 proposal carries.
 
+## Two ways to run the same pipeline
+
+The exact same `scripts/` logic (classify → heal → validate → render → apply)
+runs in two harnesses:
+
+1. **GitHub Actions** (`.github/workflows/`) — event-triggered, wired per repo.
+   This is the zero-infrastructure path.
+2. **Docker agent** (`agent/` + `Dockerfile`) — a container you run yourself,
+   detached from a repo's CI. This is the step toward an install-once GitHub
+   App: the agent clones the PR branch, runs the suites and heals it *itself*,
+   and talks to GitHub over REST with a token you pass in. The `test.yml` CI
+   gate still runs independently as the normal check.
+
+The agent runs the **image's** copy of `scripts/` against the **cloned**
+workspace (image logic is fixed and tamper-proof; only app/test files come from
+the PR), so both harnesses are behaviourally identical.
+
+### Running the agent
+
+```bash
+docker build -t healer-agent:poc .
+
+# 1. Diagnose + propose fixes for a PR (posts proposal comments)
+docker run --rm \
+  -e GITHUB_TOKEN=<pat-with-contents+pr-write> \
+  -e GEMINI_API_KEY=<key> \
+  healer-agent:poc propose --repo <owner/name> --pr <N>
+
+# 2. After a maintainer comments /approve, apply it (RBAC-checked, race-checked)
+docker run --rm \
+  -e GITHUB_TOKEN=<pat-with-contents+pr-write> \
+  healer-agent:poc apply --repo <owner/name> --pr <N>
+```
+
+`propose` runs all three suites, and for each failing one classifies →
+(if a stale-reference) heals → validates → posts a proposal, or posts a
+flag-only comment for app-bugs/infra/failed-validation. `apply` finds the
+latest `/approve`, verifies that commenter is a maintainer via the permission
+API, checks the branch hasn't moved since the proposal, then commits the fix as
+`healer-bot` and posts a resolution comment. `GITHUB_TOKEN` can be the same PAT
+value already stored as the `HEALER_PAT` secret.
+
+### Pointing the agent at a different repo
+
+The agent's `--repo`/`--pr` flags already work against any GitHub repo. What's
+still specific to *this* repo, by default, is where source lives, what command
+runs each suite, and how deps get installed — a real FE/BE repo won't share
+this repo's `apps/py` / `apps/js` layout or exact CLI invocations.
+
+A target repo opts into different behavior by committing a `.healer.json` at
+its root (see this repo's own, which just documents the defaults):
+
+```json
+{
+  "frameworks": {
+    "pytest": {
+      "install": ["pip", "install", "-r", "requirements.txt"],
+      "test": ["pytest", "--json-report", "--json-report-file=pytest-results.json"],
+      "report": "pytest-results.json",
+      "sourceDir": "backend/app"
+    }
+  }
+}
+```
+
+Any field left out falls back to the built-in default (`agent/config.js`);
+any framework left out of the file falls back entirely. This generalizes the
+agent to **any repo using Playwright, pytest, or vitest**, regardless of
+folder layout or npm scripts — it does not add support for a different test
+runner (Jest, Cypress, JUnit, ...). That needs a new adapter
+(`scripts/lib/adapters/<name>.js`) + `TEST_FIX_SIGNALS` entry + heal prompt,
+following the same pattern as the three already built.
+
+Install/test commands read from `.healer.json` run with `GITHUB_TOKEN` and
+`GEMINI_API_KEY` stripped from their environment (`agent/workspace.js`'s
+`sanitizedEnv`) — that file is attacker-influenced content on a fork PR, so
+the agent's own secrets must never be reachable from a command it names.
+
 ## What this proves
 
 1. A code change breaks a test (a stale locator, or a renamed function/export

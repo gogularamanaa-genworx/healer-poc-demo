@@ -1,0 +1,21 @@
+{
+  "frameworks": {
+    "playwright": {
+      "install": ["npm", "ci", "--ignore-scripts"],
+      "test": ["npx", "playwright", "test"],
+      "report": "results.json"
+    },
+    "pytest": {
+      "install": [],
+      "test": ["pytest", "--json-report", "--json-report-file=pytest-results.json"],
+      "report": "pytest-results.json",
+      "sourceDir": "apps/py"
+    },
+    "vitest": {
+      "install": ["npm", "ci", "--ignore-scripts"],
+      "test": ["npx", "vitest", "run", "--reporter=json", "--outputFile=vitest-results.json"],
+      "report": "vitest-results.json",
+      "sourceDir": "apps/js"
+    }
+  }
+}

@@ -20,7 +20,11 @@ const MODEL = 'gemini-3.1-pro-preview';
 // Where each framework's application source lives — included in the heal
 // context for pytest/vitest so the model can see the renamed interface. (For
 // Playwright the page snapshot in error-context.md already carries that truth.)
-const APP_SOURCE_DIR = { pytest: 'apps/py', vitest: 'apps/js' };
+// This repo's own layout is the default; the Docker agent overrides it per
+// target repo via HEALER_SOURCE_DIR, resolved from that repo's .healer.json
+// (see agent/config.js). The GitHub Actions path never sets this env var, so
+// it keeps using these defaults unchanged.
+const DEFAULT_APP_SOURCE_DIR = { pytest: 'apps/py', vitest: 'apps/js' };
 
 async function callGemini(prompt) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
@@ -67,7 +71,8 @@ function buildContext(target) {
     return fs.readFileSync(target.contextPath, 'utf8');
   }
   const testSource = fs.readFileSync(target.file, 'utf8');
-  const appSource = readSourceDir(APP_SOURCE_DIR[target.framework]);
+  const sourceDir = process.env.HEALER_SOURCE_DIR || DEFAULT_APP_SOURCE_DIR[target.framework];
+  const appSource = readSourceDir(sourceDir);
   return [
     `# Failing test file: ${target.file}`,
     '```',
@@ -172,6 +177,12 @@ async function main() {
 
   fs.writeFileSync('candidate.diff', diff);
   const baseSha = execFileSync('git', ['rev-parse', 'HEAD']).toString().trim();
+  // Carries the resolved rerun command (from this repo's .healer.json, via
+  // the Docker agent's HEALER_TEST_COMMAND env var) through to validate.js's
+  // flake-check gate, so it reruns the SAME command that produced this
+  // failure. Absent on the GitHub Actions path, where validate.js falls back
+  // to its own per-framework defaults unchanged.
+  const testCommand = process.env.HEALER_TEST_COMMAND ? JSON.parse(process.env.HEALER_TEST_COMMAND) : null;
   const meta = {
     baseSha,
     tier: 1,
@@ -179,6 +190,7 @@ async function main() {
     targetTest: target.title,
     targetFile: target.file,
     model: MODEL,
+    testCommand,
     confidenceSignals: {}, // filled in by validate.js
   };
   fs.writeFileSync('meta.json', JSON.stringify(meta, null, 2));

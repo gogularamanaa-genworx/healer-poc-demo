@@ -4,18 +4,50 @@
 // that produced the failure. Confidence is earned here — never a number the
 // model states.
 const fs = require('fs');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 
-// The rerun command per framework. PYTEST is overridable so a local venv
+// The rerun command per framework, used when meta.testCommand (set by
+// heal.js from the Docker agent's resolved .healer.json config) isn't
+// present — i.e. on the GitHub Actions path, or against this repo's own
+// default layout. PYTEST is overridable so a local venv
 // (./.venv/bin/pytest) can be used; CI leaves it on PATH.
 const RERUN_COMMAND = {
-  playwright: 'npx playwright test',
-  pytest: process.env.PYTEST || 'pytest',
-  vitest: 'npx vitest run',
+  playwright: ['npx', 'playwright', 'test'],
+  pytest: [process.env.PYTEST || 'pytest'],
+  vitest: ['npx', 'vitest', 'run'],
 };
 
 function sh(cmd) {
   return execSync(cmd, { stdio: 'pipe' }).toString();
+}
+
+// The rerun re-executes PR-authored test code (possibly via a command a
+// target repo's .healer.json named itself) — strip the agent's own secrets
+// so that code can never read them out of its environment. Duplicated from
+// agent/workspace.js's sanitizedEnv rather than imported: scripts/ is the
+// image's fixed, tamper-proof logic and must stay independent of agent/ so
+// it also runs standalone under GitHub Actions.
+function sanitizedEnv() {
+  const { GITHUB_TOKEN, GEMINI_API_KEY, ...rest } = process.env;
+  return rest;
+}
+
+// meta.testCommand is attacker-influenced (originates in a target repo's
+// .healer.json) by the time it reaches here — validated at load time in
+// agent/config.js, but re-checked defensively since this file also runs
+// under GitHub Actions without that validation ever having run.
+function resolveCommand(meta) {
+  if (meta.testCommand !== undefined && meta.testCommand !== null) {
+    if (!Array.isArray(meta.testCommand) || !meta.testCommand.every((v) => typeof v === 'string' && v)) {
+      throw new Error('meta.testCommand is present but not a non-empty string array — refusing to run it.');
+    }
+    return meta.testCommand;
+  }
+  return RERUN_COMMAND[meta.framework];
+}
+
+function runCommand(cmd) {
+  return execFileSync(cmd[0], cmd.slice(1), { stdio: 'pipe', env: sanitizedEnv() }).toString();
 }
 
 function main() {
@@ -24,7 +56,7 @@ function main() {
     process.exit(1);
   }
   const meta = JSON.parse(fs.readFileSync('meta.json', 'utf8'));
-  const command = RERUN_COMMAND[meta.framework];
+  const command = resolveCommand(meta);
   if (!command) {
     console.log(`No rerun command for framework '${meta.framework}'.`);
     process.exit(1);
@@ -43,10 +75,10 @@ function main() {
 
   for (const key of ['runOnePass', 'runTwoPass']) {
     try {
-      sh(command);
+      runCommand(command);
       signals[key] = true;
     } catch (e) {
-      console.log(`Rerun failed (${key}) via '${command}':`, e.message);
+      console.log(`Rerun failed (${key}) via '${command.join(' ')}':`, e.message);
       break;
     }
   }
@@ -62,4 +94,8 @@ function main() {
   console.log(`Patch validated for ${meta.framework}: applies + passes twice (flake check).`);
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = { resolveCommand, sanitizedEnv };
